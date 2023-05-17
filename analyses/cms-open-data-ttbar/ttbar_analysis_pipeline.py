@@ -510,338 +510,339 @@ class TtbarAnalysis(processor.ProcessorABC):
     def postprocess(self, accumulator):
         return accumulator
 
-# %% [markdown]
-# ### "Fileset" construction and metadata
-#
-# Here, we gather all the required information about the files we want to process: paths to the files and asociated metadata.
-
-# %% tags=[]
-fileset = utils.construct_fileset(N_FILES_MAX_PER_SAMPLE, use_xcache=False, af_name=config["benchmarking"]["AF_NAME"])  # local files on /data for ssl-dev
-
-print(f"processes in fileset: {list(fileset.keys())}")
-print(f"\nexample of information in fileset:\n{{\n  'files': [{fileset['ttbar__nominal']['files'][0]}, ...],")
-print(f"  'metadata': {fileset['ttbar__nominal']['metadata']}\n}}")
-
-
-# %% [markdown]
-# ### ServiceX-specific functionality: query setup
-#
-# Define the func_adl query to be used for the purpose of extracting columns and filtering.
-
-# %% tags=[]
-def get_query(source: ObjectStream) -> ObjectStream:
-    """Query for event / column selection: >=4j >=1b, ==1 lep with pT>25 GeV, return relevant columns
-    """
-    return source.Where(lambda e: e.Electron_pt.Where(lambda pt: pt > 25).Count()
-                        + e.Muon_pt.Where(lambda pt: pt > 25).Count() == 1)\
-                 .Where(lambda f: f.Jet_pt.Where(lambda pt: pt > 25).Count() >= 4)\
-                 .Where(lambda g: {"pt": g.Jet_pt,
-                                   "btagCSVV2": g.Jet_btagCSVV2}.Zip().Where(lambda jet:
-                                                                             jet.btagCSVV2 >= 0.5
-                                                                             and jet.pt > 25).Count() >= 1)\
-                 .Select(lambda h: {"Electron_pt": h.Electron_pt,
-                                    "Electron_eta": h.Electron_eta,
-                                    "Electron_phi": h.Electron_phi,
-                                    "Electron_mass": h.Electron_mass,
-                                    "Muon_pt": h.Muon_pt,
-                                    "Muon_eta": h.Muon_eta,
-                                    "Muon_phi": h.Muon_phi,
-                                    "Muon_mass": h.Muon_mass,
-                                    "Jet_mass": h.Jet_mass,
-                                    "Jet_pt": h.Jet_pt,
-                                    "Jet_eta": h.Jet_eta,
-                                    "Jet_phi": h.Jet_phi,
-                                    "Jet_btagCSVV2": h.Jet_btagCSVV2,
-                                    "Jet_qgl": h.Jet_qgl,
-                                   })
-
-
-# %% [markdown]
-# ### Caching the queried datasets with `ServiceX`
-#
-# Using the queries created with `func_adl`, we are using `ServiceX` to read the CMS Open Data files to build cached files with only the specific event information as dictated by the query.
-
-# %% tags=[]
-if USE_SERVICEX:
-    # dummy dataset on which to generate the query
-    dummy_ds = ServiceXSourceUpROOT("cernopendata://dummy", "Events", backend_name="uproot")
-
-    # tell low-level infrastructure not to contact ServiceX yet, only to
-    # return the qastle string it would have sent
-    dummy_ds.return_qastle = True
-
-    # create the query
-    query = get_query(dummy_ds).value()
-
-    # now we query the files using a wrapper around ServiceXDataset to transform all processes at once
-    t0 = time.time()
-    ds = utils.ServiceXDatasetGroup(fileset, backend_name="uproot", ignore_cache=config["global"]["SERVICEX_IGNORE_CACHE"])
-    files_per_process = ds.get_data_rootfiles_uri(query, as_signed_url=True, title="CMS ttbar")
-
-    print(f"ServiceX data delivery took {time.time() - t0:.2f} seconds")
-
-    # update fileset to point to ServiceX-transformed files
-    for process in fileset.keys():
-        fileset[process]["files"] = [f.url for f in files_per_process[process]]
-
-# %% [markdown]
-# ### Execute the data delivery pipeline
-#
-# What happens here depends on the flag `USE_SERVICEX`. If set to true, the processor is run on the data previously gathered by ServiceX, then will gather output histograms.
-#
-# When `USE_SERVICEX` is false, the input files need to be processed during this step as well.
-
-# %% tags=[]
-NanoAODSchema.warn_missing_crossrefs = False # silences warnings about branches we will not use here
-if USE_DASK:
-    executor = processor.DaskExecutor(client=utils.get_client(af=config["global"]["AF"]))
-else:
-    executor = processor.FuturesExecutor(workers=config["benchmarking"]["NUM_CORES"])
-
-run = processor.Runner(executor=executor, schema=NanoAODSchema, savemetrics=True, metadata_cache={}, chunksize=config["benchmarking"]["CHUNKSIZE"])
-
-if USE_SERVICEX:
-    treename = "servicex"
-
-else:
-    treename = "Events"
-
-if not USE_DASK and not USE_TRITON and USE_INFERENCE:
-    model_even = config["ml"]["XGBOOST_MODEL_PATH_EVEN"]
-    model_odd = config["ml"]["XGBOOST_MODEL_PATH_ODD"]
-
-elif not USE_TRITON and USE_INFERENCE:
-    model_even = XGBClassifier()
-    model_even.load_model(config["ml"]["XGBOOST_MODEL_PATH_EVEN"])
-    model_odd = XGBClassifier()
-    model_odd.load_model(config["ml"]["XGBOOST_MODEL_PATH_ODD"])
-
-else:
-    model_even = None
-    model_odd = None
-
-filemeta = run.preprocess(fileset, treename=treename)  # pre-processing
-
-t0 = time.monotonic()
-all_histograms, metrics = run(fileset, treename, processor_instance=TtbarAnalysis(USE_DASK,
-                                                                                  config["benchmarking"]["DISABLE_PROCESSING"],
-                                                                                  config["benchmarking"]["IO_BRANCHES"][
-                                                                                      config["benchmarking"]["IO_FILE_PERCENT"]
-                                                                                  ],
-                                                                                  config["ml"],
-                                                                                  model_even,
-                                                                                  model_odd,
-                                                                                  permutations_dict))  # processing
-exec_time = time.monotonic() - t0
-
-print(f"\nexecution took {exec_time:.2f} seconds")
-
-# %%
-# track metrics
-dataset_source = "/data" if fileset["ttbar__nominal"]["files"][0].startswith("/data") else "https://xrootd-local.unl.edu:1094" # TODO: xcache support
-metrics.update({
-    "walltime": exec_time,
-    "num_workers": config["benchmarking"]["NUM_CORES"],
-    "af": config["benchmarking"]["AF_NAME"],
-    "dataset_source": dataset_source,
-    "use_dask": USE_DASK,
-    "use_servicex": USE_SERVICEX,
-    "systematics": config["benchmarking"]["SYSTEMATICS"],
-    "n_files_max_per_sample": N_FILES_MAX_PER_SAMPLE,
-    "cores_per_worker": config["benchmarking"]["CORES_PER_WORKER"],
-    "chunksize": config["benchmarking"]["CHUNKSIZE"],
-    "disable_processing": config["benchmarking"]["DISABLE_PROCESSING"],
-    "io_file_percent": config["benchmarking"]["IO_FILE_PERCENT"]
-})
-
-# save metrics to disk
-if not os.path.exists("metrics"):
-    os.makedirs("metrics")
-timestamp = time.strftime('%Y%m%d-%H%M%S')
-af_name = metrics["af"]
-metric_file_name = f"metrics/{af_name}-{timestamp}.json"
-with open(metric_file_name, "w") as f:
-    f.write(json.dumps(metrics))
-
-print(f"metrics saved as {metric_file_name}")
-#print(f"event rate per worker (full execution time divided by NUM_CORES={NUM_CORES}): {metrics['entries'] / NUM_CORES / exec_time / 1_000:.2f} kHz")
-print(f"event rate per worker (pure processtime): {metrics['entries'] / metrics['processtime'] / 1_000:.2f} kHz")
-print(f"amount of data read: {metrics['bytesread']/1000**2:.2f} MB")  # likely buggy: https://github.com/CoffeaTeam/coffea/issues/717
-
-# %% [markdown]
-# ### Inspecting the produced histograms
-#
-# Let's have a look at the data we obtained.
-# We built histograms in two phase space regions, for multiple physics processes and systematic variations.
-
-# %% tags=[]
-utils.set_style()
-
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
-plt.legend(frameon=False)
-plt.title("$\geq$ 4 jets, 1 b-tag")
-plt.xlabel("$H_T$ [GeV]");
-
-# %% tags=[]
-all_histograms["hist"][:, "4j2b", :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1,edgecolor="grey")
-plt.legend(frameon=False)
-plt.title("$\geq$ 4 jets, $\geq$ 2 b-tags")
-plt.xlabel("$m_{bjj}$ [GeV]");
-
-# %% [markdown]
-# Our top reconstruction approach ($bjj$ system with largest $p_T$) has worked!
-#
-# Let's also have a look at some systematic variations:
-# - b-tagging, which we implemented as jet-kinematic dependent event weights,
-# - jet energy variations, which vary jet kinematics, resulting in acceptance effects and observable changes.
-#
-# We are making of [UHI](https://uhi.readthedocs.io/) here to re-bin.
-
-# %% tags=[]
-# b-tagging variations
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "nominal"].plot(label="nominal", linewidth=2)
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_0_up"].plot(label="NP 1", linewidth=2)
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_1_up"].plot(label="NP 2", linewidth=2)
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_2_up"].plot(label="NP 3", linewidth=2)
-all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_3_up"].plot(label="NP 4", linewidth=2)
-plt.legend(frameon=False)
-plt.xlabel("$H_T$ [GeV]")
-plt.title("b-tagging variations");
-
-# %% tags=[]
-# jet energy scale variations
-all_histograms["hist"][:, "4j2b", "ttbar", "nominal"].plot(label="nominal", linewidth=2)
-all_histograms["hist"][:, "4j2b", "ttbar", "pt_scale_up"].plot(label="scale up", linewidth=2)
-all_histograms["hist"][:, "4j2b", "ttbar", "pt_res_up"].plot(label="resolution up", linewidth=2)
-plt.legend(frameon=False)
-plt.xlabel("$m_{bjj}$ [Gev]")
-plt.title("Jet energy variations");
-
-# %% tags=[]
-# ML inference variables
-if USE_INFERENCE:
-    for i in range(len(config["ml"]["FEATURE_NAMES"])):
-        all_histograms['ml_hist_dict'][f'hist_{config["ml"]["FEATURE_NAMES"][i]}'][:, :, "nominal"].stack("process").project("observable").plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
-        plt.legend(frameon=False)
-        plt.title(f"ML Observable #{i}")
-        plt.show()
-
-# %% [markdown]
-# ### Save histograms to disk
-#
-# We'll save everything to disk for subsequent usage.
-# This also builds pseudo-data by combining events from the various simulation setups we have processed.
-
-# %% tags=[]
-utils.save_histograms(all_histograms['hist'], fileset, "histograms.root")
-if USE_INFERENCE:
-    utils.save_ml_histograms(all_histograms['ml_hist_dict'], fileset, "histograms_ml.root", config)
-
-# %% [markdown]
-# ### Statistical inference
-#
-# A statistical model has been defined in `config.yml`, ready to be used with our output.
-# We will use `cabinetry` to combine all histograms into a `pyhf` workspace and fit the resulting statistical model to the pseudodata we built.
-
-# %% tags=[]
-config = cabinetry.configuration.load("cabinetry_config.yml")
-cabinetry.templates.collect(config)
-cabinetry.templates.postprocess(config)  # optional post-processing (e.g. smoothing)
-ws = cabinetry.workspace.build(config)
-cabinetry.workspace.save(ws, "workspace.json")
-
-# %% [markdown]
-# We can inspect the workspace with `pyhf`, or use `pyhf` to perform inference.
-
-# %% tags=[]
-# !pyhf inspect workspace.json | head -n 20
-
-# %% [markdown]
-# Let's try out what we built: the next cell will perform a maximum likelihood fit of our statistical model to the pseudodata we built.
-
-# %% tags=[]
-model, data = cabinetry.model_utils.model_and_data(ws)
-fit_results = cabinetry.fit.fit(model, data)
-
-cabinetry.visualize.pulls(
-    fit_results, exclude="ttbar_norm", close_figure=True, save_figure=False
-)
-
-# %% [markdown]
-# For this pseudodata, what is the resulting ttbar cross-section divided by the Standard Model prediction?
-
-# %% tags=[]
-poi_index = model.config.poi_index
-print(f"\nfit result for ttbar_norm: {fit_results.bestfit[poi_index]:.3f} +/- {fit_results.uncertainty[poi_index]:.3f}")
-
-# %% [markdown]
-# Let's also visualize the model before and after the fit, in both the regions we are using.
-# The binning here corresponds to the binning used for the fit.
-
-# %%
-model_prediction = cabinetry.model_utils.prediction(model)
-figs = cabinetry.visualize.data_mc(model_prediction, data, close_figure=True, config=config)
-figs[0]["figure"]
-
-# %% tags=[]
-figs[1]["figure"]
-
-# %% [markdown]
-# We can see very good post-fit agreement.
-
-# %% tags=[]
-model_prediction_postfit = cabinetry.model_utils.prediction(model, fit_results=fit_results)
-figs = cabinetry.visualize.data_mc(model_prediction_postfit, data, close_figure=True, config=config)
-figs[0]["figure"]
-
-# %% tags=[]
-figs[1]["figure"]
-
-# %% [markdown]
-# ### ML Validation
-# We can further validate our results by applying the above fit to different ML observables and checking for good agreement.
-
-# %% tags=[]
-# load the ml workspace (uses the ml observable instead of previous method)
-config_ml = cabinetry.configuration.load("cabinetry_config_ml.yml")
-cabinetry.templates.collect(config_ml)
-cabinetry.templates.postprocess(config_ml)  # optional post-processing (e.g. smoothing)
-
-ws_ml = cabinetry.workspace.build(config_ml)
-ws_pruned = pyhf.Workspace(ws_ml).prune(channels=["Feature3", "Feature8", "Feature9",
-                                                  "Feature10", "Feature11", "Feature12",
-                                                  "Feature13", "Feature14", "Feature15",
-                                                  "Feature16", "Feature17", "Feature18",
-                                                  "Feature19"])
-
-cabinetry.workspace.save(ws_pruned, "workspace_ml.json")
-
-# %% tags=[]
-model_ml, data_ml = cabinetry.model_utils.model_and_data(ws_pruned)
-
-# %% [markdown]
-# We have a channel for each ML observable:
-
-# %%
-# !pyhf inspect workspace_ml.json | head -n 20
-
-# %%
-# obtain model prediction before and after fit
-model_prediction = cabinetry.model_utils.prediction(model_ml)
-fit_results_mod = cabinetry.model_utils.match_fit_results(model_ml, fit_results)
-model_prediction_postfit = cabinetry.model_utils.prediction(model_ml, fit_results=fit_results_mod)
-
-# %% tags=[]
-figs = utils.plot_data_mc(model_prediction, model_prediction_postfit, data_ml, config_ml)
-
-# %% [markdown]
-# ### What is next?
-#
-# Our next goals for this pipeline demonstration are:
-# - making this analysis even **more feature-complete**,
-# - **addressing performance bottlenecks** revealed by this demonstrator,
-# - **collaborating** with you!
-#
-# Please do not hesitate to get in touch if you would like to join the effort, or are interested in re-implementing (pieces of) the pipeline with different tools!
-#
-# Our mailing list is analysis-grand-challenge@iris-hep.org, sign up via the [Google group](https://groups.google.com/a/iris-hep.org/g/analysis-grand-challenge).
+if __name__ == "__main__":
+    # %% [markdown]
+    # ### "Fileset" construction and metadata
+    #
+    # Here, we gather all the required information about the files we want to process: paths to the files and asociated metadata.
+    
+    # %% tags=[]
+    fileset = utils.construct_fileset(N_FILES_MAX_PER_SAMPLE, use_xcache=False, af_name=config["benchmarking"]["AF_NAME"])  # local files on /data for ssl-dev
+    
+    print(f"processes in fileset: {list(fileset.keys())}")
+    print(f"\nexample of information in fileset:\n{{\n  'files': [{fileset['ttbar__nominal']['files'][0]}, ...],")
+    print(f"  'metadata': {fileset['ttbar__nominal']['metadata']}\n}}")
+    
+    
+    # %% [markdown]
+    # ### ServiceX-specific functionality: query setup
+    #
+    # Define the func_adl query to be used for the purpose of extracting columns and filtering.
+    
+    # %% tags=[]
+    def get_query(source: ObjectStream) -> ObjectStream:
+        """Query for event / column selection: >=4j >=1b, ==1 lep with pT>25 GeV, return relevant columns
+        """
+        return source.Where(lambda e: e.Electron_pt.Where(lambda pt: pt > 25).Count()
+                            + e.Muon_pt.Where(lambda pt: pt > 25).Count() == 1)\
+                     .Where(lambda f: f.Jet_pt.Where(lambda pt: pt > 25).Count() >= 4)\
+                     .Where(lambda g: {"pt": g.Jet_pt,
+                                       "btagCSVV2": g.Jet_btagCSVV2}.Zip().Where(lambda jet:
+                                                                                 jet.btagCSVV2 >= 0.5
+                                                                                 and jet.pt > 25).Count() >= 1)\
+                     .Select(lambda h: {"Electron_pt": h.Electron_pt,
+                                        "Electron_eta": h.Electron_eta,
+                                        "Electron_phi": h.Electron_phi,
+                                        "Electron_mass": h.Electron_mass,
+                                        "Muon_pt": h.Muon_pt,
+                                        "Muon_eta": h.Muon_eta,
+                                        "Muon_phi": h.Muon_phi,
+                                        "Muon_mass": h.Muon_mass,
+                                        "Jet_mass": h.Jet_mass,
+                                        "Jet_pt": h.Jet_pt,
+                                        "Jet_eta": h.Jet_eta,
+                                        "Jet_phi": h.Jet_phi,
+                                        "Jet_btagCSVV2": h.Jet_btagCSVV2,
+                                        "Jet_qgl": h.Jet_qgl,
+                                       })
+    
+    
+    # %% [markdown]
+    # ### Caching the queried datasets with `ServiceX`
+    #
+    # Using the queries created with `func_adl`, we are using `ServiceX` to read the CMS Open Data files to build cached files with only the specific event information as dictated by the query.
+    
+    # %% tags=[]
+    if USE_SERVICEX:
+        # dummy dataset on which to generate the query
+        dummy_ds = ServiceXSourceUpROOT("cernopendata://dummy", "Events", backend_name="uproot")
+    
+        # tell low-level infrastructure not to contact ServiceX yet, only to
+        # return the qastle string it would have sent
+        dummy_ds.return_qastle = True
+    
+        # create the query
+        query = get_query(dummy_ds).value()
+    
+        # now we query the files using a wrapper around ServiceXDataset to transform all processes at once
+        t0 = time.time()
+        ds = utils.ServiceXDatasetGroup(fileset, backend_name="uproot", ignore_cache=config["global"]["SERVICEX_IGNORE_CACHE"])
+        files_per_process = ds.get_data_rootfiles_uri(query, as_signed_url=True, title="CMS ttbar")
+    
+        print(f"ServiceX data delivery took {time.time() - t0:.2f} seconds")
+    
+        # update fileset to point to ServiceX-transformed files
+        for process in fileset.keys():
+            fileset[process]["files"] = [f.url for f in files_per_process[process]]
+    
+    # %% [markdown]
+    # ### Execute the data delivery pipeline
+    #
+    # What happens here depends on the flag `USE_SERVICEX`. If set to true, the processor is run on the data previously gathered by ServiceX, then will gather output histograms.
+    #
+    # When `USE_SERVICEX` is false, the input files need to be processed during this step as well.
+    
+    # %% tags=[]
+    NanoAODSchema.warn_missing_crossrefs = False # silences warnings about branches we will not use here
+    if USE_DASK:
+        executor = processor.DaskExecutor(client=utils.get_client(af=config["global"]["AF"]))
+    else:
+        executor = processor.FuturesExecutor(workers=config["benchmarking"]["NUM_CORES"])
+    
+    run = processor.Runner(executor=executor, schema=NanoAODSchema, savemetrics=True, metadata_cache={}, chunksize=config["benchmarking"]["CHUNKSIZE"])
+    
+    if USE_SERVICEX:
+        treename = "servicex"
+    
+    else:
+        treename = "Events"
+    
+    if not USE_DASK and not USE_TRITON and USE_INFERENCE:
+        model_even = config["ml"]["XGBOOST_MODEL_PATH_EVEN"]
+        model_odd = config["ml"]["XGBOOST_MODEL_PATH_ODD"]
+    
+    elif not USE_TRITON and USE_INFERENCE:
+        model_even = XGBClassifier()
+        model_even.load_model(config["ml"]["XGBOOST_MODEL_PATH_EVEN"])
+        model_odd = XGBClassifier()
+        model_odd.load_model(config["ml"]["XGBOOST_MODEL_PATH_ODD"])
+    
+    else:
+        model_even = None
+        model_odd = None
+    
+    filemeta = run.preprocess(fileset, treename=treename)  # pre-processing
+    
+    t0 = time.monotonic()
+    all_histograms, metrics = run(fileset, treename, processor_instance=TtbarAnalysis(USE_DASK,
+                                                                                      config["benchmarking"]["DISABLE_PROCESSING"],
+                                                                                      config["benchmarking"]["IO_BRANCHES"][
+                                                                                          config["benchmarking"]["IO_FILE_PERCENT"]
+                                                                                      ],
+                                                                                      config["ml"],
+                                                                                      model_even,
+                                                                                      model_odd,
+                                                                                      permutations_dict))  # processing
+    exec_time = time.monotonic() - t0
+    
+    print(f"\nexecution took {exec_time:.2f} seconds")
+    
+    # %%
+    # track metrics
+    dataset_source = "/data" if fileset["ttbar__nominal"]["files"][0].startswith("/data") else "https://xrootd-local.unl.edu:1094" # TODO: xcache support
+    metrics.update({
+        "walltime": exec_time,
+        "num_workers": config["benchmarking"]["NUM_CORES"],
+        "af": config["benchmarking"]["AF_NAME"],
+        "dataset_source": dataset_source,
+        "use_dask": USE_DASK,
+        "use_servicex": USE_SERVICEX,
+        "systematics": config["benchmarking"]["SYSTEMATICS"],
+        "n_files_max_per_sample": N_FILES_MAX_PER_SAMPLE,
+        "cores_per_worker": config["benchmarking"]["CORES_PER_WORKER"],
+        "chunksize": config["benchmarking"]["CHUNKSIZE"],
+        "disable_processing": config["benchmarking"]["DISABLE_PROCESSING"],
+        "io_file_percent": config["benchmarking"]["IO_FILE_PERCENT"]
+    })
+    
+    # save metrics to disk
+    if not os.path.exists("metrics"):
+        os.makedirs("metrics")
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    af_name = metrics["af"]
+    metric_file_name = f"metrics/{af_name}-{timestamp}.json"
+    with open(metric_file_name, "w") as f:
+        f.write(json.dumps(metrics))
+    
+    print(f"metrics saved as {metric_file_name}")
+    #print(f"event rate per worker (full execution time divided by NUM_CORES={NUM_CORES}): {metrics['entries'] / NUM_CORES / exec_time / 1_000:.2f} kHz")
+    print(f"event rate per worker (pure processtime): {metrics['entries'] / metrics['processtime'] / 1_000:.2f} kHz")
+    print(f"amount of data read: {metrics['bytesread']/1000**2:.2f} MB")  # likely buggy: https://github.com/CoffeaTeam/coffea/issues/717
+    
+    # %% [markdown]
+    # ### Inspecting the produced histograms
+    #
+    # Let's have a look at the data we obtained.
+    # We built histograms in two phase space regions, for multiple physics processes and systematic variations.
+    
+    # %% tags=[]
+    utils.set_style()
+    
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
+    plt.legend(frameon=False)
+    plt.title("$\geq$ 4 jets, 1 b-tag")
+    plt.xlabel("$H_T$ [GeV]");
+    
+    # %% tags=[]
+    all_histograms["hist"][:, "4j2b", :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1,edgecolor="grey")
+    plt.legend(frameon=False)
+    plt.title("$\geq$ 4 jets, $\geq$ 2 b-tags")
+    plt.xlabel("$m_{bjj}$ [GeV]");
+    
+    # %% [markdown]
+    # Our top reconstruction approach ($bjj$ system with largest $p_T$) has worked!
+    #
+    # Let's also have a look at some systematic variations:
+    # - b-tagging, which we implemented as jet-kinematic dependent event weights,
+    # - jet energy variations, which vary jet kinematics, resulting in acceptance effects and observable changes.
+    #
+    # We are making of [UHI](https://uhi.readthedocs.io/) here to re-bin.
+    
+    # %% tags=[]
+    # b-tagging variations
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "nominal"].plot(label="nominal", linewidth=2)
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_0_up"].plot(label="NP 1", linewidth=2)
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_1_up"].plot(label="NP 2", linewidth=2)
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_2_up"].plot(label="NP 3", linewidth=2)
+    all_histograms["hist"][120j::hist.rebin(2), "4j1b", "ttbar", "btag_var_3_up"].plot(label="NP 4", linewidth=2)
+    plt.legend(frameon=False)
+    plt.xlabel("$H_T$ [GeV]")
+    plt.title("b-tagging variations");
+    
+    # %% tags=[]
+    # jet energy scale variations
+    all_histograms["hist"][:, "4j2b", "ttbar", "nominal"].plot(label="nominal", linewidth=2)
+    all_histograms["hist"][:, "4j2b", "ttbar", "pt_scale_up"].plot(label="scale up", linewidth=2)
+    all_histograms["hist"][:, "4j2b", "ttbar", "pt_res_up"].plot(label="resolution up", linewidth=2)
+    plt.legend(frameon=False)
+    plt.xlabel("$m_{bjj}$ [Gev]")
+    plt.title("Jet energy variations");
+    
+    # %% tags=[]
+    # ML inference variables
+    if USE_INFERENCE:
+        for i in range(len(config["ml"]["FEATURE_NAMES"])):
+            all_histograms['ml_hist_dict'][f'hist_{config["ml"]["FEATURE_NAMES"][i]}'][:, :, "nominal"].stack("process").project("observable").plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
+            plt.legend(frameon=False)
+            plt.title(f"ML Observable #{i}")
+            plt.show()
+    
+    # %% [markdown]
+    # ### Save histograms to disk
+    #
+    # We'll save everything to disk for subsequent usage.
+    # This also builds pseudo-data by combining events from the various simulation setups we have processed.
+    
+    # %% tags=[]
+    utils.save_histograms(all_histograms['hist'], fileset, "histograms.root")
+    if USE_INFERENCE:
+        utils.save_ml_histograms(all_histograms['ml_hist_dict'], fileset, "histograms_ml.root", config)
+    
+    # %% [markdown]
+    # ### Statistical inference
+    #
+    # A statistical model has been defined in `config.yml`, ready to be used with our output.
+    # We will use `cabinetry` to combine all histograms into a `pyhf` workspace and fit the resulting statistical model to the pseudodata we built.
+    
+    # %% tags=[]
+    config = cabinetry.configuration.load("cabinetry_config.yml")
+    cabinetry.templates.collect(config)
+    cabinetry.templates.postprocess(config)  # optional post-processing (e.g. smoothing)
+    ws = cabinetry.workspace.build(config)
+    cabinetry.workspace.save(ws, "workspace.json")
+    
+    # %% [markdown]
+    # We can inspect the workspace with `pyhf`, or use `pyhf` to perform inference.
+    
+    # %% tags=[]
+    # !pyhf inspect workspace.json | head -n 20
+    
+    # %% [markdown]
+    # Let's try out what we built: the next cell will perform a maximum likelihood fit of our statistical model to the pseudodata we built.
+    
+    # %% tags=[]
+    model, data = cabinetry.model_utils.model_and_data(ws)
+    fit_results = cabinetry.fit.fit(model, data)
+    
+    cabinetry.visualize.pulls(
+        fit_results, exclude="ttbar_norm", close_figure=True, save_figure=False
+    )
+    
+    # %% [markdown]
+    # For this pseudodata, what is the resulting ttbar cross-section divided by the Standard Model prediction?
+    
+    # %% tags=[]
+    poi_index = model.config.poi_index
+    print(f"\nfit result for ttbar_norm: {fit_results.bestfit[poi_index]:.3f} +/- {fit_results.uncertainty[poi_index]:.3f}")
+    
+    # %% [markdown]
+    # Let's also visualize the model before and after the fit, in both the regions we are using.
+    # The binning here corresponds to the binning used for the fit.
+    
+    # %%
+    model_prediction = cabinetry.model_utils.prediction(model)
+    figs = cabinetry.visualize.data_mc(model_prediction, data, close_figure=True, config=config)
+    figs[0]["figure"]
+    
+    # %% tags=[]
+    figs[1]["figure"]
+    
+    # %% [markdown]
+    # We can see very good post-fit agreement.
+    
+    # %% tags=[]
+    model_prediction_postfit = cabinetry.model_utils.prediction(model, fit_results=fit_results)
+    figs = cabinetry.visualize.data_mc(model_prediction_postfit, data, close_figure=True, config=config)
+    figs[0]["figure"]
+    
+    # %% tags=[]
+    figs[1]["figure"]
+    
+    # %% [markdown]
+    # ### ML Validation
+    # We can further validate our results by applying the above fit to different ML observables and checking for good agreement.
+    
+    # %% tags=[]
+    # load the ml workspace (uses the ml observable instead of previous method)
+    config_ml = cabinetry.configuration.load("cabinetry_config_ml.yml")
+    cabinetry.templates.collect(config_ml)
+    cabinetry.templates.postprocess(config_ml)  # optional post-processing (e.g. smoothing)
+    
+    ws_ml = cabinetry.workspace.build(config_ml)
+    ws_pruned = pyhf.Workspace(ws_ml).prune(channels=["Feature3", "Feature8", "Feature9",
+                                                      "Feature10", "Feature11", "Feature12",
+                                                      "Feature13", "Feature14", "Feature15",
+                                                      "Feature16", "Feature17", "Feature18",
+                                                      "Feature19"])
+    
+    cabinetry.workspace.save(ws_pruned, "workspace_ml.json")
+    
+    # %% tags=[]
+    model_ml, data_ml = cabinetry.model_utils.model_and_data(ws_pruned)
+    
+    # %% [markdown]
+    # We have a channel for each ML observable:
+    
+    # %%
+    # !pyhf inspect workspace_ml.json | head -n 20
+    
+    # %%
+    # obtain model prediction before and after fit
+    model_prediction = cabinetry.model_utils.prediction(model_ml)
+    fit_results_mod = cabinetry.model_utils.match_fit_results(model_ml, fit_results)
+    model_prediction_postfit = cabinetry.model_utils.prediction(model_ml, fit_results=fit_results_mod)
+    
+    # %% tags=[]
+    figs = utils.plot_data_mc(model_prediction, model_prediction_postfit, data_ml, config_ml)
+    
+    # %% [markdown]
+    # ### What is next?
+    #
+    # Our next goals for this pipeline demonstration are:
+    # - making this analysis even **more feature-complete**,
+    # - **addressing performance bottlenecks** revealed by this demonstrator,
+    # - **collaborating** with you!
+    #
+    # Please do not hesitate to get in touch if you would like to join the effort, or are interested in re-implementing (pieces of) the pipeline with different tools!
+    #
+    # Our mailing list is analysis-grand-challenge@iris-hep.org, sign up via the [Google group](https://groups.google.com/a/iris-hep.org/g/analysis-grand-challenge).
