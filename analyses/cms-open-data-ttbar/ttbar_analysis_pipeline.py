@@ -374,7 +374,8 @@ fileset = utils.file_input.construct_fileset(
     use_xcache=False,
     af_name=utils.config["benchmarking"]["AF_NAME"],
     input_from_eos=utils.config["benchmarking"]["INPUT_FROM_EOS"],
-)  # local files on /data for af_name="ssl-dev"
+    local_data_cache="./data",
+)  # local files on /data for ssl-dev
 
 print(f"processes in fileset: {list(fileset.keys())}")
 print(f"\nexample of information in fileset:\n{{\n  'files': [{fileset['ttbar__nominal']['files'][0]}, ...],")
