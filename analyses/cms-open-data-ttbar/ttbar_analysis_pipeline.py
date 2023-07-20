@@ -89,7 +89,7 @@ logging.getLogger("cabinetry").setLevel(logging.INFO)
 # %%
 ### GLOBAL CONFIGURATION
 # input files per process, set to e.g. 10 (smaller number = faster)
-N_FILES_MAX_PER_SAMPLE = 5
+N_FILES_MAX_PER_SAMPLE = 1
 
 # enable Dask
 USE_DASK = True
