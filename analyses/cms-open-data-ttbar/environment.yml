@@ -1,4 +1,4 @@
-name: agc-py310
+name: agc-py310-uproot5
 channels:
   - conda-forge
 dependencies:
@@ -161,7 +161,7 @@ dependencies:
   - tritonclient
   - typing_extensions
   - uhi
-  - uproot
+  - uproot=5
   - uproot3
   - uproot3-methods
   - uri-template
