@@ -504,236 +504,237 @@ if USE_SERVICEX:
 # When `USE_SERVICEX` is false, the input files need to be processed during this step as well.
 
 # %%
-NanoAODSchema.warn_missing_crossrefs = False # silences warnings about branches we will not use here
-if USE_DASK:
-    cloudpickle.register_pickle_by_value(utils) # serialize methods and objects in utils so that they can be accessed within the coffea processor
-    executor = processor.DaskExecutor(client=utils.clients.get_client(af=utils.config["global"]["AF"]))
-else:
-    executor = processor.FuturesExecutor(workers=utils.config["benchmarking"]["NUM_CORES"])
+if __name__ == "__main__":
+    NanoAODSchema.warn_missing_crossrefs = False # silences warnings about branches we will not use here
+    if USE_DASK:
+        cloudpickle.register_pickle_by_value(utils) # serialize methods and objects in utils so that they can be accessed within the coffea processor
+        executor = processor.DaskExecutor(client=utils.clients.get_client(af=utils.config["global"]["AF"]))
+    else:
+        executor = processor.FuturesExecutor(workers=utils.config["benchmarking"]["NUM_CORES"])
 
-run = processor.Runner(
-    executor=executor, 
-    schema=NanoAODSchema, 
-    savemetrics=True, 
-    metadata_cache={}, 
-    chunksize=utils.config["benchmarking"]["CHUNKSIZE"])
+    run = processor.Runner(
+        executor=executor, 
+        schema=NanoAODSchema, 
+        savemetrics=True, 
+        metadata_cache={}, 
+        chunksize=utils.config["benchmarking"]["CHUNKSIZE"])
 
-if USE_SERVICEX:
-    treename = "servicex"
+    if USE_SERVICEX:
+        treename = "servicex"
 
-else:
-    treename = "Events"
+    else:
+        treename = "Events"
 
-# load local models if not using Triton
-if USE_INFERENCE and not USE_TRITON:
-    # models are not yet loaded
-    assert utils.ml.model_even is None
-    assert utils.ml.model_odd is None
+    # load local models if not using Triton
+    if USE_INFERENCE and not USE_TRITON:
+        # models are not yet loaded
+        assert utils.ml.model_even is None
+        assert utils.ml.model_odd is None
     
-    utils.ml.load_models()
+        utils.ml.load_models()
 
-filemeta = run.preprocess(fileset, treename=treename)  # pre-processing
+    filemeta = run.preprocess(fileset, treename=treename)  # pre-processing
 
-t0 = time.monotonic()
-# processing
-all_histograms, metrics = run(
-    fileset, 
-    treename, 
-    processor_instance=TtbarAnalysis(USE_INFERENCE, USE_TRITON)
-)
-exec_time = time.monotonic() - t0
+    t0 = time.monotonic()
+    # processing
+    all_histograms, metrics = run(
+        fileset, 
+        treename, 
+        processor_instance=TtbarAnalysis(USE_INFERENCE, USE_TRITON)
+    )
+    exec_time = time.monotonic() - t0
 
-print(f"\nexecution took {exec_time:.2f} seconds")
+    print(f"\nexecution took {exec_time:.2f} seconds")
 
-# %%
-# track metrics
-utils.metrics.track_metrics(metrics, fileset, exec_time, USE_DASK, USE_SERVICEX, N_FILES_MAX_PER_SAMPLE)
+    # %%
+    # track metrics
+    utils.metrics.track_metrics(metrics, fileset, exec_time, USE_DASK, USE_SERVICEX, N_FILES_MAX_PER_SAMPLE)
 
-# %% [markdown]
-# ### Inspecting the produced histograms
-#
-# Let's have a look at the data we obtained.
-# We built histograms in two phase space regions, for multiple physics processes and systematic variations.
+    # %% [markdown]
+    # ### Inspecting the produced histograms
+    #
+    # Let's have a look at the data we obtained.
+    # We built histograms in two phase space regions, for multiple physics processes and systematic variations.
 
-# %%
-utils.plotting.set_style()
+    # %%
+    utils.plotting.set_style()
 
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
-plt.legend(frameon=False)
-plt.title("$\geq$ 4 jets, 1 b-tag")
-plt.xlabel("$H_T$ [GeV]");
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1, edgecolor="grey")
+    plt.legend(frameon=False)
+    plt.title("$\geq$ 4 jets, 1 b-tag")
+    plt.xlabel("$H_T$ [GeV]");
 
-# %%
-all_histograms["hist_dict"]["4j2b"][:, :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1,edgecolor="grey")
-plt.legend(frameon=False)
-plt.title("$\geq$ 4 jets, $\geq$ 2 b-tags")
-plt.xlabel("$m_{bjj}$ [GeV]");
+    # %%
+    all_histograms["hist_dict"]["4j2b"][:, :, "nominal"].stack("process")[::-1].plot(stack=True, histtype="fill", linewidth=1,edgecolor="grey")
+    plt.legend(frameon=False)
+    plt.title("$\geq$ 4 jets, $\geq$ 2 b-tags")
+    plt.xlabel("$m_{bjj}$ [GeV]");
 
-# %% [markdown]
-# Our top reconstruction approach ($bjj$ system with largest $p_T$) has worked!
-#
-# Let's also have a look at some systematic variations:
-# - b-tagging, which we implemented as jet-kinematic dependent event weights,
-# - jet energy variations, which vary jet kinematics, resulting in acceptance effects and observable changes.
-#
-# We are making of [UHI](https://uhi.readthedocs.io/) here to re-bin.
+    # %% [markdown]
+    # Our top reconstruction approach ($bjj$ system with largest $p_T$) has worked!
+    #
+    # Let's also have a look at some systematic variations:
+    # - b-tagging, which we implemented as jet-kinematic dependent event weights,
+    # - jet energy variations, which vary jet kinematics, resulting in acceptance effects and observable changes.
+    #
+    # We are making of [UHI](https://uhi.readthedocs.io/) here to re-bin.
 
-# %%
-# b-tagging variations
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "nominal"].plot(label="nominal", linewidth=2)
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_0_up"].plot(label="NP 1", linewidth=2)
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_1_up"].plot(label="NP 2", linewidth=2)
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_2_up"].plot(label="NP 3", linewidth=2)
-all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_3_up"].plot(label="NP 4", linewidth=2)
-plt.legend(frameon=False)
-plt.xlabel("$H_T$ [GeV]")
-plt.title("b-tagging variations");
+    # %%
+    # b-tagging variations
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "nominal"].plot(label="nominal", linewidth=2)
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_0_up"].plot(label="NP 1", linewidth=2)
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_1_up"].plot(label="NP 2", linewidth=2)
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_2_up"].plot(label="NP 3", linewidth=2)
+    all_histograms["hist_dict"]["4j1b"][120j::hist.rebin(2), "ttbar", "btag_var_3_up"].plot(label="NP 4", linewidth=2)
+    plt.legend(frameon=False)
+    plt.xlabel("$H_T$ [GeV]")
+    plt.title("b-tagging variations");
 
-# %%
-# jet energy scale variations
-all_histograms["hist_dict"]["4j2b"][:, "ttbar", "nominal"].plot(label="nominal", linewidth=2)
-all_histograms["hist_dict"]["4j2b"][:, "ttbar", "pt_scale_up"].plot(label="scale up", linewidth=2)
-all_histograms["hist_dict"]["4j2b"][:, "ttbar", "pt_res_up"].plot(label="resolution up", linewidth=2)
-plt.legend(frameon=False)
-plt.xlabel("$m_{bjj}$ [Gev]")
-plt.title("Jet energy variations");
+    # %%
+    # jet energy scale variations
+    all_histograms["hist_dict"]["4j2b"][:, "ttbar", "nominal"].plot(label="nominal", linewidth=2)
+    all_histograms["hist_dict"]["4j2b"][:, "ttbar", "pt_scale_up"].plot(label="scale up", linewidth=2)
+    all_histograms["hist_dict"]["4j2b"][:, "ttbar", "pt_res_up"].plot(label="resolution up", linewidth=2)
+    plt.legend(frameon=False)
+    plt.xlabel("$m_{bjj}$ [Gev]")
+    plt.title("Jet energy variations");
 
-# %%
-# ML inference variables
-if USE_INFERENCE:
-    fig, axs = plt.subplots(10,2,figsize=(14,40))
-    for i in range(len(utils.config["ml"]["FEATURE_NAMES"])):
-        if i<10: 
-            column=0
-            row=i
-        else: 
-            column=1
-            row=i-10
-        all_histograms['ml_hist_dict'][utils.config["ml"]["FEATURE_NAMES"][i]][:, :, "nominal"].stack("process").project("observable").plot(
-            stack=True, 
-            histtype="fill", 
-            linewidth=1, 
-            edgecolor="grey", 
-            ax=axs[row,column]
-        )
-        axs[row, column].legend(frameon=False)
-    fig.show()
+    # %%
+    # ML inference variables
+    if USE_INFERENCE:
+        fig, axs = plt.subplots(10,2,figsize=(14,40))
+        for i in range(len(utils.config["ml"]["FEATURE_NAMES"])):
+            if i<10: 
+                column=0
+                row=i
+            else: 
+                column=1
+                row=i-10
+            all_histograms['ml_hist_dict'][utils.config["ml"]["FEATURE_NAMES"][i]][:, :, "nominal"].stack("process").project("observable").plot(
+                stack=True, 
+                histtype="fill", 
+                linewidth=1, 
+                edgecolor="grey", 
+                ax=axs[row,column]
+            )
+            axs[row, column].legend(frameon=False)
+        fig.show()
 
-# %% [markdown]
-# ### Save histograms to disk
-#
-# We'll save everything to disk for subsequent usage.
-# This also builds pseudo-data by combining events from the various simulation setups we have processed.
+    # %% [markdown]
+    # ### Save histograms to disk
+    #
+    # We'll save everything to disk for subsequent usage.
+    # This also builds pseudo-data by combining events from the various simulation setups we have processed.
 
-# %%
-utils.file_output.save_histograms(all_histograms['hist_dict'], 
-                                  fileset, 
-                                  "histograms.root", 
-                                  ["4j1b", "4j2b"])
-if USE_INFERENCE:
-    utils.file_output.save_histograms(all_histograms['ml_hist_dict'], 
+    # %%
+    utils.file_output.save_histograms(all_histograms['hist_dict'], 
                                       fileset, 
-                                      "histograms_ml.root", 
-                                      utils.config["ml"]["FEATURE_NAMES"], 
-                                      rebin=False)
+                                      "histograms.root", 
+                                      ["4j1b", "4j2b"])
+    if USE_INFERENCE:
+        utils.file_output.save_histograms(all_histograms['ml_hist_dict'], 
+                                          fileset, 
+                                          "histograms_ml.root", 
+                                          utils.config["ml"]["FEATURE_NAMES"], 
+                                          rebin=False)
 
-# %% [markdown]
-# ### Statistical inference
-#
-# A statistical model has been defined in `config.yml`, ready to be used with our output.
-# We will use `cabinetry` to combine all histograms into a `pyhf` workspace and fit the resulting statistical model to the pseudodata we built.
+    # %% [markdown]
+    # ### Statistical inference
+    #
+    # A statistical model has been defined in `config.yml`, ready to be used with our output.
+    # We will use `cabinetry` to combine all histograms into a `pyhf` workspace and fit the resulting statistical model to the pseudodata we built.
 
-# %%
-config = cabinetry.configuration.load("cabinetry_config.yml")
-cabinetry.templates.collect(config)
-cabinetry.templates.postprocess(config)  # optional post-processing (e.g. smoothing)
-ws = cabinetry.workspace.build(config)
-cabinetry.workspace.save(ws, "workspace.json")
+    # %%
+    config = cabinetry.configuration.load("cabinetry_config.yml")
+    cabinetry.templates.collect(config)
+    cabinetry.templates.postprocess(config)  # optional post-processing (e.g. smoothing)
+    ws = cabinetry.workspace.build(config)
+    cabinetry.workspace.save(ws, "workspace.json")
 
-# %% [markdown]
-# We can inspect the workspace with `pyhf`, or use `pyhf` to perform inference.
+    # %% [markdown]
+    # We can inspect the workspace with `pyhf`, or use `pyhf` to perform inference.
 
-# %%
-# !pyhf inspect workspace.json | head -n 20
+    # %%
+    # !pyhf inspect workspace.json | head -n 20
 
-# %% [markdown]
-# Let's try out what we built: the next cell will perform a maximum likelihood fit of our statistical model to the pseudodata we built.
+    # %% [markdown]
+    # Let's try out what we built: the next cell will perform a maximum likelihood fit of our statistical model to the pseudodata we built.
 
-# %%
-model, data = cabinetry.model_utils.model_and_data(ws)
-fit_results = cabinetry.fit.fit(model, data)
+    # %%
+    model, data = cabinetry.model_utils.model_and_data(ws)
+    fit_results = cabinetry.fit.fit(model, data)
 
-cabinetry.visualize.pulls(
-    fit_results, exclude="ttbar_norm", close_figure=True, save_figure=False
-)
+    cabinetry.visualize.pulls(
+        fit_results, exclude="ttbar_norm", close_figure=True, save_figure=False
+    )
 
-# %% [markdown]
-# For this pseudodata, what is the resulting ttbar cross-section divided by the Standard Model prediction?
+    # %% [markdown]
+    # For this pseudodata, what is the resulting ttbar cross-section divided by the Standard Model prediction?
 
-# %%
-poi_index = model.config.poi_index
-print(f"\nfit result for ttbar_norm: {fit_results.bestfit[poi_index]:.3f} +/- {fit_results.uncertainty[poi_index]:.3f}")
+    # %%
+    poi_index = model.config.poi_index
+    print(f"\nfit result for ttbar_norm: {fit_results.bestfit[poi_index]:.3f} +/- {fit_results.uncertainty[poi_index]:.3f}")
 
-# %% [markdown]
-# Let's also visualize the model before and after the fit, in both the regions we are using.
-# The binning here corresponds to the binning used for the fit.
+    # %% [markdown]
+    # Let's also visualize the model before and after the fit, in both the regions we are using.
+    # The binning here corresponds to the binning used for the fit.
 
-# %%
-model_prediction = cabinetry.model_utils.prediction(model)
-model_prediction_postfit = cabinetry.model_utils.prediction(model, fit_results=fit_results)
-figs = cabinetry.visualize.data_mc(model_prediction, data, close_figure=True, config=config)
-# below method reimplements this visualization in a grid view
-utils.plotting.plot_data_mc(model_prediction, model_prediction_postfit, data, config)
+    # %%
+    model_prediction = cabinetry.model_utils.prediction(model)
+    model_prediction_postfit = cabinetry.model_utils.prediction(model, fit_results=fit_results)
+    figs = cabinetry.visualize.data_mc(model_prediction, data, close_figure=True, config=config)
+    # below method reimplements this visualization in a grid view
+    utils.plotting.plot_data_mc(model_prediction, model_prediction_postfit, data, config)
 
-# %% [markdown]
-# ### ML Validation
-# We can further validate our results by applying the above fit to different ML observables and checking for good agreement.
+    # %% [markdown]
+    # ### ML Validation
+    # We can further validate our results by applying the above fit to different ML observables and checking for good agreement.
 
-# %%
-# load the ml workspace (uses the ml observable instead of previous method)
-if USE_INFERENCE:
-    config_ml = cabinetry.configuration.load("cabinetry_config_ml.yml")
-    cabinetry.templates.collect(config_ml)
-    cabinetry.templates.postprocess(config_ml)  # optional post-processing (e.g. smoothing)
+    # %%
+    # load the ml workspace (uses the ml observable instead of previous method)
+    if USE_INFERENCE:
+        config_ml = cabinetry.configuration.load("cabinetry_config_ml.yml")
+        cabinetry.templates.collect(config_ml)
+        cabinetry.templates.postprocess(config_ml)  # optional post-processing (e.g. smoothing)
 
-    ws_ml = cabinetry.workspace.build(config_ml)
-    ws_pruned = pyhf.Workspace(ws_ml).prune(channels=["Feature3", "Feature8", "Feature9",
-                                                      "Feature10", "Feature11", "Feature12",
-                                                      "Feature13", "Feature14", "Feature15",
-                                                      "Feature16", "Feature17", "Feature18",
-                                                      "Feature19"])
+        ws_ml = cabinetry.workspace.build(config_ml)
+        ws_pruned = pyhf.Workspace(ws_ml).prune(channels=["Feature3", "Feature8", "Feature9",
+                                                          "Feature10", "Feature11", "Feature12",
+                                                          "Feature13", "Feature14", "Feature15",
+                                                          "Feature16", "Feature17", "Feature18",
+                                                          "Feature19"])
 
-    cabinetry.workspace.save(ws_pruned, "workspace_ml.json")
+        cabinetry.workspace.save(ws_pruned, "workspace_ml.json")
 
-# %%
-if USE_INFERENCE:
-    model_ml, data_ml = cabinetry.model_utils.model_and_data(ws_pruned)
+    # %%
+    if USE_INFERENCE:
+        model_ml, data_ml = cabinetry.model_utils.model_and_data(ws_pruned)
 
-# %% [markdown]
-# We have a channel for each ML observable:
+    # %% [markdown]
+    # We have a channel for each ML observable:
 
-# %%
-# !pyhf inspect workspace_ml.json | head -n 20
+    # %%
+    # !pyhf inspect workspace_ml.json | head -n 20
 
-# %%
-# obtain model prediction before and after fit
-if USE_INFERENCE:
-    model_prediction = cabinetry.model_utils.prediction(model_ml)
-    fit_results_mod = cabinetry.model_utils.match_fit_results(model_ml, fit_results)
-    model_prediction_postfit = cabinetry.model_utils.prediction(model_ml, fit_results=fit_results_mod)
+    # %%
+    # obtain model prediction before and after fit
+    if USE_INFERENCE:
+        model_prediction = cabinetry.model_utils.prediction(model_ml)
+        fit_results_mod = cabinetry.model_utils.match_fit_results(model_ml, fit_results)
+        model_prediction_postfit = cabinetry.model_utils.prediction(model_ml, fit_results=fit_results_mod)
 
-# %%
-if USE_INFERENCE:
-    utils.plotting.plot_data_mc(model_prediction, model_prediction_postfit, data_ml, config_ml)
+    # %%
+    if USE_INFERENCE:
+        utils.plotting.plot_data_mc(model_prediction, model_prediction_postfit, data_ml, config_ml)
 
-# %% [markdown]
-# ### What is next?
-#
-# Our next goals for this pipeline demonstration are:
-# - making this analysis even **more feature-complete**,
-# - **addressing performance bottlenecks** revealed by this demonstrator,
-# - **collaborating** with you!
-#
-# Please do not hesitate to get in touch if you would like to join the effort, or are interested in re-implementing (pieces of) the pipeline with different tools!
-#
-# Our mailing list is analysis-grand-challenge@iris-hep.org, sign up via the [Google group](https://groups.google.com/a/iris-hep.org/g/analysis-grand-challenge).
+    # %% [markdown]
+    # ### What is next?
+    #
+    # Our next goals for this pipeline demonstration are:
+    # - making this analysis even **more feature-complete**,
+    # - **addressing performance bottlenecks** revealed by this demonstrator,
+    # - **collaborating** with you!
+    #
+    # Please do not hesitate to get in touch if you would like to join the effort, or are interested in re-implementing (pieces of) the pipeline with different tools!
+    #
+    # Our mailing list is analysis-grand-challenge@iris-hep.org, sign up via the [Google group](https://groups.google.com/a/iris-hep.org/g/analysis-grand-challenge).
